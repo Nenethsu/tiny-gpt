@@ -29,8 +29,9 @@ no server, no API, no ML library.
 - `colab.ipynb`: run everything on Google Colab.
 - `pretrain.py`: step 1 of the Tiny GPT Reader: a ~17.5M-parameter model that reads word pieces,
   pretrained on Simple English Wikipedia. Saves and resumes from its `--out` folder.
-- `finetune.py`: step 2 of the Reader: fine-tunes it on SQuAD 2.0 to answer questions from a
-  passage (or say there's no answer), and scores it on the 11,873-question dev set.
+- `finetune.py`: step 2 of the Reader: fine-tunes it on SQuAD 2.0 and CoQA to answer questions
+  from a passage in a conversation (follow-ups, yes/no, or "no answer"), and scores it on both
+  dev sets.
   `python finetune.py --check-data` tests the data side without a GPU.
 - `reader.ipynb`: run both Reader steps on Colab, with progress saved to Google Drive.
 

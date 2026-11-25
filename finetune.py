@@ -1,22 +1,29 @@
-"""Fine-tune the pretrained Tiny GPT Reader to answer questions from a passage (SQuAD 2.0).
+"""Fine-tune the pretrained Tiny GPT Reader to answer questions from a passage, in a conversation.
 
-Step 2 of 2 (step 1 is pretrain.py). Each example is one prompt and the answer to learn:
+Step 2 of 2 (step 1 is pretrain.py). It learns from two datasets:
+- SQuAD 2.0: single questions about Wikipedia paragraphs; a third have no answer in the passage.
+- CoQA: conversations about a passage ("Who was Jessica?" ... "How old was she?"), so it learns
+  to follow up on earlier turns. Up to 2 earlier turns go into the prompt.
 
-    <|eos|> <|ctx|> passage <|q|> question <|a|> answer <|eos|>
-    <|eos|> <|ctx|> passage <|q|> question <|a|> <|noans|> <|eos|>     (the passage doesn't say)
+Each example is one prompt and the answer to learn:
 
-The loss counts only the answer, so the model spends everything on answering. Answers are
-copied from the passage, encoded exactly as they appear there (" Paris", with its space).
-Passages are trimmed to about 150 words around the answer: the size of what the portfolio's
-search hands the reader.
+    <|eos|> <|ctx|> passage [<|q|> earlier question <|a|> earlier answer]... <|q|> question <|a|> answer <|eos|>
+    ... <|a|> <|noans|> <|eos|>     (the passage doesn't say)
+
+The loss counts only the answer. Answers are copied from the passage, encoded exactly as they
+appear there (" Paris", with its space), or are " yes" / " no". CoQA answers that reword the
+passage are left out as targets (they stay in the history), so the model learns to copy, not
+to invent. Passages are trimmed to about 150 words around the answer: the size of what the
+portfolio's search hands the reader.
 
     python finetune.py --init /content/drive/MyDrive/tiny-gpt-reader --out /content/drive/MyDrive/tiny-gpt-reader/qa
     python finetune.py --preset smoke --init /content/reader-smoke --out /content/reader-qa-smoke
     python finetune.py --check-data --tokenizer out/tokenizer-test.json   # data only, no torch
 
-The exam is the SQuAD 2.0 dev set (11,873 questions, never trained on): exact match and F1 as
-SQuAD scores them, "no answer" accuracy, and how the portfolio's safety check would do (an
-answer is shown only if it appears word for word in the passage).
+Two exams, never trained on: SQuAD 2.0 dev (11,873 questions) and CoQA dev (7,983 conversation
+turns, asked with their history). Each reports exact match and F1 as SQuAD scores them,
+"no answer" accuracy, and the portfolio's safety check: an answer is shown only if it appears
+word for word in the passage, or is yes/no.
 """
 
 import argparse
@@ -32,12 +39,14 @@ from collections import Counter
 import bpe
 
 SQUAD_URL = "https://rajpurkar.github.io/SQuAD-explorer/dataset/{split}-v2.0.json"
+COQA_URL = "https://downloads.cs.stanford.edu/nlp/data/coqa/coqa-{split}-v1.0.json"
 MAX_WORDS = 150  # passage window, about the size of one search passage
 MAX_ANSWER_TOKENS = 32
+HISTORY_TURNS = 2
 
 PRESETS = {
-    "default": dict(iters=8000, batch_size=32, lr=3e-4, warmup=200, eval_every=1000,
-                    eval_questions=500, save_every=250, max_train=None),
+    "default": dict(iters=10000, batch_size=32, lr=3e-4, warmup=200, eval_every=1000,
+                    eval_questions=300, save_every=250, max_train=None),
     "smoke": dict(iters=40, batch_size=8, lr=1e-3, warmup=5, eval_every=20,
                   eval_questions=20, save_every=20, max_train=2000),
 }
@@ -45,16 +54,23 @@ PRESETS = {
 
 # ---------------------------------------------------------------- data (pure Python)
 
-def download(split, folder="data"):
-    path = os.path.join(folder, f"squad-{split}-v2.json")
+def download(url, path):
     if not os.path.exists(path):
-        os.makedirs(folder, exist_ok=True)
-        print(f"downloading SQuAD 2.0 {split}...")
-        with urllib.request.urlopen(SQUAD_URL.format(split=split)) as r, open(path + ".part", "wb") as f:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        print(f"downloading {url.rsplit('/', 1)[-1]}...")
+        with urllib.request.urlopen(url) as r, open(path + ".part", "wb") as f:
             f.write(r.read())
         os.replace(path + ".part", path)
     with open(path, encoding="utf-8") as f:
         return json.load(f)["data"]
+
+
+def squad(split):
+    return download(SQUAD_URL.format(split=split), f"data/squad-{split}-v2.json")
+
+
+def coqa(split):
+    return download(COQA_URL.format(split=split), f"data/coqa-{split}.json")
 
 
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])")
@@ -74,8 +90,9 @@ def words(text):
 
 
 def window(context, rng, start=None, end=None):
-    """A run of whole sentences of at most MAX_WORDS. With an answer (start, end), the run
-    contains it, placed at a random spot. Returns (text, offset of the text in context)."""
+    """A run of whole sentences of at most MAX_WORDS. With a span (start, end), the run
+    contains it, placed at a random spot. Returns (text, offset of the text in context),
+    or None if the span alone is too long."""
     if words(context) <= MAX_WORDS:
         return context, 0
     spans = sentence_spans(context)
@@ -87,7 +104,7 @@ def window(context, rng, start=None, end=None):
         hi = max(hi, lo)
     size = lambda a, b: words(context[spans[a][0]:spans[b][1]])  # noqa: E731
     if size(lo, hi) > MAX_WORDS:
-        return None  # one huge sentence: skip the example
+        return None
     while True:
         options = []
         if lo > 0 and size(lo - 1, hi) <= MAX_WORDS:
@@ -100,11 +117,14 @@ def window(context, rng, start=None, end=None):
     return context[spans[lo][0]:spans[hi][1]], spans[lo][0]
 
 
-def prompt_ids(tok, passage, question):
-    """The reader's prompt. The portfolio builds exactly the same one in the browser."""
+def prompt_ids(tok, passage, question, history=()):
+    """The reader's prompt; `history` is earlier (question, answer) turns, oldest first.
+    The portfolio builds exactly the same one in the browser."""
     s = tok.special
-    return ([s["<|eos|>"], s["<|ctx|>"]] + tok.encode(passage.strip())
-            + [s["<|q|>"]] + tok.encode(question.strip()) + [s["<|a|>"]])
+    ids = [s["<|eos|>"], s["<|ctx|>"]] + tok.encode(passage.strip())
+    for q, a in list(history)[-HISTORY_TURNS:]:
+        ids += [s["<|q|>"]] + tok.encode(q.strip()) + [s["<|a|>"]] + tok.encode(" " + a.strip())
+    return ids + [s["<|q|>"]] + tok.encode(question.strip()) + [s["<|a|>"]]
 
 
 def answer_ids(tok, passage, start, text):
@@ -113,7 +133,11 @@ def answer_ids(tok, passage, start, text):
     return tok.encode(prefix + text) + [tok.special["<|eos|>"]]
 
 
-def build_examples(articles, tok, rng, block_size, max_examples=None):
+def is_yes_no(text):
+    return normalize(text) in ("yes", "no")
+
+
+def build_squad(articles, tok, rng, block_size, max_examples=None):
     """(prompt ids, answer ids, info) for every question; info keeps what the exam needs."""
     noans = [tok.special["<|noans|>"], tok.special["<|eos|>"]]
     out, skipped = [], 0
@@ -139,10 +163,8 @@ def build_examples(articles, tok, rng, block_size, max_examples=None):
                         skipped += 1
                         continue
                     passage, offset = win
-                    local = start - offset
-                    answers = [a["text"] for a in qa["answers"]
-                               if 0 <= a["answer_start"] - offset and a["text"] in passage]
-                    ans = answer_ids(tok, passage, local, text)
+                    answers = [a["text"] for a in qa["answers"] if a["text"] in passage]
+                    ans = answer_ids(tok, passage, start - offset, text)
                     if len(ans) > MAX_ANSWER_TOKENS:
                         skipped += 1
                         continue
@@ -153,6 +175,71 @@ def build_examples(articles, tok, rng, block_size, max_examples=None):
                 out.append((prompt, ans, {"passage": passage, "question": qa["question"], "answers": answers}))
                 if max_examples and len(out) >= max_examples:
                     return out, skipped
+    return out, skipped
+
+
+def coqa_target(passage, text, near):
+    """Where `text` sits in `passage` (as-is, else ignoring case), preferring the spot nearest
+    `near`. Returns (start, the passage's own spelling) or None."""
+    found = []
+    for hay, needle in ((passage, text), (passage.lower(), text.lower())):
+        i = hay.find(needle)
+        while i >= 0:
+            found.append(i)
+            i = hay.find(needle, i + 1)
+        if found:
+            break
+    if not found:
+        return None
+    start = min(found, key=lambda i: abs(i - near))
+    return start, passage[start:start + len(text)]
+
+
+def build_coqa(stories, tok, rng, block_size, max_examples=None, exam=False):
+    """Conversation turns. Targets: a copy from the passage, " yes"/" no", or no answer.
+    Reworded answers are skipped as targets in training (kept in the history); the exam keeps
+    every turn and grades against all the annotators' answers."""
+    s = tok.special
+    noans = [s["<|noans|>"], s["<|eos|>"]]
+    out, skipped = [], 0
+    for story in stories:
+        context = story["story"]
+        extra = story.get("additional_answers", {})
+        history = []
+        for q, a in zip(story["questions"], story["answers"]):
+            question, said = q["input_text"], a["input_text"].strip()
+            clean = said.rstrip(".").strip()
+            golds = [clean] + [x[a["turn_id"] - 1]["input_text"].strip().rstrip(".")
+                               for x in extra.values() if len(x) >= a["turn_id"]]
+            span_start = a["span_start"] if a["span_start"] >= 0 else 0
+            span_end = a["span_end"] if a["span_end"] >= 0 else span_start
+            win = window(context, rng, span_start, max(span_end, span_start + 1))
+            target = None
+            if win is not None:
+                passage, offset = win
+                if normalize(clean) == "unknown":
+                    target, golds = noans, []
+                elif is_yes_no(clean):
+                    target = tok.encode(" " + normalize(clean)) + [s["<|eos|>"]]
+                else:
+                    hit = coqa_target(passage, clean, span_start - offset)
+                    if hit:
+                        target = answer_ids(tok, passage, hit[0], hit[1])
+                if target is not None or exam:
+                    prompt = prompt_ids(tok, passage, question, history)
+                    t = target or noans
+                    if len(t) <= MAX_ANSWER_TOKENS and len(prompt) + len(t) <= block_size:
+                        out.append((prompt, t, {"passage": passage, "question": question,
+                                                "answers": golds, "history": list(history[-HISTORY_TURNS:])}))
+                    else:
+                        skipped += 1
+                else:
+                    skipped += 1
+            else:
+                skipped += 1
+            history.append((question, said))
+            if max_examples and len(out) >= max_examples:
+                return out, skipped
     return out, skipped
 
 
@@ -175,6 +262,11 @@ def f1(pred, gold):
     return 2 * precision * recall / (precision + recall)
 
 
+def shown(pred, passage):
+    """The portfolio's safety check: shown only if word for word in the passage, or yes/no."""
+    return bool(pred) and (pred in passage or is_yes_no(pred))
+
+
 def score(rows):
     """rows: (prediction or "" for no answer, gold answers ([] = no answer), passage)."""
     has, no = [r for r in rows if r[1]], [r for r in rows if not r[1]]
@@ -188,7 +280,7 @@ def score(rows):
                 max(f1(pred, g) for g in golds))
 
     results = [em_f1(p, g) for p, g, _ in rows]
-    shown = [(p, g) for p, g, passage in rows if p and p in passage]
+    visible = [(p, g) for p, g, passage in rows if shown(p, passage)]
     pct = lambda xs: round(100 * sum(xs) / len(xs), 1) if xs else 0.0  # noqa: E731
     return {
         "count": len(rows),
@@ -197,39 +289,45 @@ def score(rows):
         "has_answer_exact": pct([em_f1(p, g)[0] for p, g, _ in has]),
         "has_answer_f1": pct([em_f1(p, g)[1] for p, g, _ in has]),
         "no_answer_correct": pct([float(p == "") for p, _, _ in no]),
-        # The portfolio shows an answer only if it's word for word in the passage.
-        "shown": pct([float(bool(p and p in passage)) for p, _, passage in rows]),
-        "shown_correct": pct([float(any(normalize(p) == normalize(x) for x in g)) for p, g in shown]),
+        "shown": pct([float(shown(p, passage)) for p, _, passage in rows]),
+        "shown_correct": pct([float(any(normalize(p) == normalize(x) for x in g)) for p, g in visible]),
     }
 
 
-def check_data(tokenizer_path):
-    """Builds examples from the dev set with a test tokenizer and checks them. No torch."""
-    tok = bpe.Tokenizer.load(tokenizer_path)
-    articles = download("dev")
-    rng = random.Random(0)
-    examples, skipped = build_examples(articles, tok, rng, block_size=512)
+def copyable(examples, tok):
     s = tok.special
-    has = [e for e in examples if e[1] != [s["<|noans|>"], s["<|eos|>"]]]
-    lengths = sorted(len(p) + len(a) for p, a, _ in examples)
-    # Can the answer be copied? Its tokens should appear in the passage tokens.
-    copyable = 0
-    for prompt, ans, _ in has:
+    has = [e for e in examples if e[1][0] != s["<|noans|>"]]
+    ok = 0
+    for prompt, ans, info in has:
         body = ans[:-1]
-        if any(prompt[i:i + len(body)] == body for i in range(len(prompt) - len(body) + 1)):
-            copyable += 1
-    print(f"{len(examples):,} examples ({len(has):,} with an answer), {skipped} skipped")
-    print(f"length in tokens: median {lengths[len(lengths) // 2]}, 95th percentile "
-          f"{lengths[int(len(lengths) * 0.95)]}, longest {lengths[-1]}")
-    print(f"answers whose tokens appear as-is in the passage: {100 * copyable / len(has):.1f}%")
-    prompt, ans, info = has[0]
-    print("example prompt:", repr(tok.decode(prompt)[:200]), "-> answer:", repr(tok.decode(ans)))
-    # The scorer, on known cases.
+        if is_yes_no(tok.decode(body)) or any(prompt[i:i + len(body)] == body
+                                               for i in range(len(prompt) - len(body) + 1)):
+            ok += 1
+    return len(has), (100 * ok / len(has) if has else 0.0)
+
+
+def check_data(tokenizer_path):
+    """Builds both datasets' dev examples with a test tokenizer and checks them. No torch."""
+    tok = bpe.Tokenizer.load(tokenizer_path)
+    for name, build, data in (("SQuAD dev", build_squad, squad("dev")), ("CoQA dev", build_coqa, coqa("dev"))):
+        examples, skipped = build(data, tok, random.Random(0), 512)
+        n_has, pct = copyable(examples, tok)
+        lengths = sorted(len(p) + len(a) for p, a, _ in examples)
+        print(f"{name}: {len(examples):,} examples ({n_has:,} with an answer), {skipped} skipped; "
+              f"tokens median {lengths[len(lengths) // 2]}, longest {lengths[-1]}; "
+              f"answers copyable or yes/no: {pct:.1f}%")
+    conv, _ = build_coqa(coqa("dev"), tok, random.Random(0), 512)
+    prompt, ans, info = next(e for e in conv if len(e[2]["history"]) == 2)
+    print("CoQA example history:", info["history"], "| question:", repr(info["question"]),
+          "| answer:", repr(tok.decode(ans)))
+    exam_rows, _ = build_coqa(coqa("dev"), tok, random.Random(0), 512, exam=True)
+    print(f"CoQA exam (every turn): {len(exam_rows):,} turns")
+
     rows = [("Paris", ["Paris"], "in Paris."), ("the Paris", ["Paris"], "x"), ("", [], "x"),
-            ("Lyon", ["Paris"], "Lyon"), ("", ["Paris"], "x")]
+            ("Lyon", ["Paris"], "Lyon"), ("", ["Paris"], "x"), ("yes", ["yes"], "x")]
     sc = score(rows)
-    assert sc["exact_match"] == 60.0 and sc["no_answer_correct"] == 100.0, sc
-    assert sc["shown"] == 40.0 and sc["shown_correct"] == 50.0, sc
+    assert sc["exact_match"] == round(100 * 4 / 6, 1) and sc["no_answer_correct"] == 100.0, sc
+    assert sc["shown"] == 50.0 and sc["shown_correct"] == round(100 * 2 / 3, 1), sc
     assert abs(f1("Paris France", "Paris") - 2 / 3) < 1e-9
     print("scorer checks passed")
 
@@ -260,11 +358,18 @@ def train(args, p):
 
     started = time.time()
     rng = random.Random(1337)
-    train_ex, skipped = build_examples(download("train"), tok, rng, cfg.block_size, p["max_train"])
-    dev_ex, dev_skipped = build_examples(download("dev"), tok, random.Random(7), cfg.block_size)
-    print(f"{len(train_ex):,} training questions ({skipped} skipped), {len(dev_ex):,} exam questions "
-          f"({dev_skipped} skipped) ({time.time() - started:.0f} s)")
-    eval_ex = random.Random(3).sample(dev_ex, min(p["eval_questions"], len(dev_ex)))
+    half = p["max_train"] // 2 if p["max_train"] else None
+    squad_train, s1 = build_squad(squad("train"), tok, rng, cfg.block_size, half)
+    coqa_train, s2 = build_coqa(coqa("train"), tok, rng, cfg.block_size, half)
+    train_ex = squad_train + coqa_train
+    exams = {
+        "squad": build_squad(squad("dev"), tok, random.Random(7), cfg.block_size)[0],
+        "coqa": build_coqa(coqa("dev"), tok, random.Random(7), cfg.block_size, exam=True)[0],
+    }
+    print(f"training: {len(squad_train):,} SQuAD questions + {len(coqa_train):,} CoQA turns "
+          f"({s1 + s2} skipped); exams: {len(exams['squad']):,} SQuAD, {len(exams['coqa']):,} CoQA "
+          f"({time.time() - started:.0f} s)")
+    quick = {k: random.Random(3).sample(v, min(p["eval_questions"], len(v))) for k, v in exams.items()}
 
     eos, noans = tok.special["<|eos|>"], tok.special["<|noans|>"]
 
@@ -320,8 +425,10 @@ def train(args, p):
 
     ckpt_path = os.path.join(args.out, "ckpt.pt")
     log = {"base_steps": base["step"], "params": model.num_params(), "config": cfg.to_dict(),
-           "dataset": "SQuAD 2.0 (Rajpurkar et al., 2018)", "train_questions": len(train_ex),
-           "exam_questions": len(dev_ex), "iters": p["iters"], "batch_size": p["batch_size"],
+           "datasets": ["SQuAD 2.0 (Rajpurkar et al., 2018)", "CoQA (Reddy et al., 2019)"],
+           "train_questions": {"squad": len(squad_train), "coqa": len(coqa_train)},
+           "exam_questions": {k: len(v) for k, v in exams.items()},
+           "iters": p["iters"], "batch_size": p["batch_size"],
            "device": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
            "loss": [], "exam": [], "train_seconds": 0}
     step = 0
@@ -350,21 +457,24 @@ def train(args, p):
                     "config": cfg.to_dict(), "step": step, "log": log}, ckpt_path + ".part")
         os.replace(ckpt_path + ".part", ckpt_path)
 
+    def summary(sc):
+        return (f"exact {sc['exact_match']}%, F1 {sc['f1']}%, no-answer {sc['no_answer_correct']}%, "
+                f"shown {sc['shown']}% ({sc['shown_correct']}% right)")
+
     recent = []
     while True:
         if step % p["eval_every"] == 0 or step == p["iters"]:
-            sc, _ = exam(eval_ex)
+            results = {k: exam(v)[0] for k, v in quick.items()}
             if not log["exam"] or log["exam"][-1]["step"] != step:
-                log["exam"].append({"step": step, **sc})
+                log["exam"].append({"step": step, **results})
             if recent:
                 log["loss"].append({"step": step, "train": round(sum(recent) / len(recent), 4)})
                 recent = []
             done = step - first
             left = (time.time() - session_start) / max(done, 1) * (p["iters"] - step)
-            print(f"step {step:>5} | exact {sc['exact_match']}% | F1 {sc['f1']}% | no-answer "
-                  f"{sc['no_answer_correct']}% | shown {sc['shown']}%, of those right {sc['shown_correct']}% | "
-                  f"{(elapsed_before + time.time() - session_start) / 60:.1f} min"
-                  + (f", ~{left / 60:.0f} min left" if done else ""))
+            print(f"step {step:>5} | {(elapsed_before + time.time() - session_start) / 60:.1f} min"
+                  + (f", ~{left / 60:.0f} min left" if done else "")
+                  + f"\n    SQuAD: {summary(results['squad'])}\n    CoQA:  {summary(results['coqa'])}")
             save()
         elif step % p["save_every"] == 0:
             save()
@@ -384,18 +494,20 @@ def train(args, p):
         scaler.update()
         step += 1
 
-    print(f"final exam on all {len(dev_ex):,} questions it never trained on...")
-    final, preds = exam(dev_ex)
-    log["final"] = final
-    examples = []
-    for pred, (_, _, info) in list(zip(preds, dev_ex))[:: max(1, len(dev_ex) // 12)][:12]:
-        examples.append({"question": info["question"], "expected": info["answers"][:1] or ["(no answer)"],
-                         "got": pred or "(no answer)"})
-    log["examples"] = examples
+    print("final exams on every question it never trained on...")
+    log["final"], log["examples"] = {}, {}
+    for name, examples in exams.items():
+        final, preds = exam(examples)
+        log["final"][name] = final
+        picks = list(zip(preds, examples))[:: max(1, len(examples) // 10)][:10]
+        log["examples"][name] = [{"history": info.get("history", []), "question": info["question"],
+                                  "expected": info["answers"][:1] or ["(no answer)"], "got": pred or "(no answer)"}
+                                 for pred, (_, _, info) in picks]
+        print(f"{name.upper()} ({final['count']:,}): {summary(final)}")
     save()
-    print(json.dumps(final, indent=1))
-    for e in examples[:6]:
-        print(f"  Q: {e['question']}\n     expected {e['expected'][0]!r}, got {e['got']!r}")
+    for e in log["examples"]["coqa"][:6]:
+        before = " / ".join(f"{q} -> {a}" for q, a in e["history"])
+        print(f"  [{before}]\n  Q: {e['question']}  expected {e['expected'][0]!r}, got {e['got']!r}")
 
 
 def main():
