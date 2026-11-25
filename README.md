@@ -1,21 +1,25 @@
 # Tiny GPT
 
 A small GPT (decoder-only transformer) built and trained from scratch. It reads and writes
-English one character at a time, trained on short children's stories, and runs in the browser
-on my portfolio with a hand-written TypeScript engine: no server, no API, no ML library.
+English one character at a time, trained on short children's stories plus addition and
+subtraction, and runs in the browser on my portfolio with a hand-written TypeScript engine:
+no server, no API, no ML library.
 
 | | |
 |---|---|
 | Parameters | about 4.8M (6 layers, 8 heads, 256 wide) |
 | Context | 256 characters |
-| Data | first 200 MB of [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) (Eldan & Li, 2023) |
-| Training | 10,000 steps, batch 64 × 256 characters, on a free Colab T4 GPU |
+| Data | first 200 MB of [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) (Eldan & Li, 2023), plus 4M generated problems like `347+28=375` and `28-347=-319` (numbers 0–999) |
+| Math exam | 2,000 problems held out of training, answered greedily; score in `training.json` |
+| Training | 15,000 steps, batch 64 × 256 characters, on a free Colab T4 GPU |
 | Download | about 5 MB (int8 weights with one float32 scale per row) |
 
 ## Files
 
 - `model.py`: the GPT in PyTorch.
-- `train.py`: downloads the data, trains, logs loss and sample stories to `out/training.json`.
+- `arithmetic.py`: makes the math problems and the held-out exam. Pure Python; `python arithmetic.py` tests it.
+- `train.py`: downloads the stories, mixes in the math, trains, and logs loss, math score and
+  sample stories to `out/training.json`.
 - `export.py`: writes `out/web/` for the browser, plus `check.json` to verify the browser engine.
 - `weights_format.py`: the `model.json` + `model.bin` format. Pure Python.
 - `reference.py`: a pure-Python forward pass, plus a random self-test model for the engine.

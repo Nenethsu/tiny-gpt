@@ -1,22 +1,28 @@
-"""Train the tiny character-level GPT on TinyStories.
+"""Train the tiny character-level GPT on TinyStories plus addition and subtraction problems.
 
-    python train.py                 # full run (GPU; about 15-30 min on a Colab T4)
+    python train.py                 # full run (GPU; about 20-35 min on a Colab T4)
     python train.py --preset smoke  # 30 steps on a tiny model, to check that everything runs
 
 Writes to out/:
     ckpt.pt        the trained weights, config and vocabulary
-    training.json  loss curve, text samples during training and run stats (shown on the portfolio page)
+    training.json  loss curve, math accuracy, text samples and run stats (shown on the portfolio page)
+
+Each story and each math problem ("347+28=375") is one document ending in EOS, shuffled together,
+so one model learns both. Math accuracy is measured on problems held out of training.
 """
 
 import argparse
 import json
 import math
 import os
+import random
 import time
 import urllib.request
+from collections import defaultdict
 
 import torch
 
+import arithmetic
 from model import GPT, GPTConfig
 
 DATA_URL = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-{split}.txt"
@@ -32,9 +38,11 @@ ALLOWED = set(chr(c) for c in range(32, 127)) | {"\n", EOS}
 
 PRESETS = {
     "default": dict(n_layer=6, n_head=8, n_embd=256, block_size=256, batch_size=64,
-                    iters=10000, eval_every=250, eval_batches=40, data_mb=200),
+                    iters=15000, eval_every=250, eval_batches=40, data_mb=200,
+                    math_problems=4_000_000, math_test=2000, math_eval=300),
     "smoke": dict(n_layer=2, n_head=2, n_embd=32, block_size=64, batch_size=8,
-                  iters=30, eval_every=10, eval_batches=2, data_mb=2),
+                  iters=30, eval_every=10, eval_batches=2, data_mb=2,
+                  math_problems=3000, math_test=40, math_eval=20),
 }
 
 
@@ -57,7 +65,7 @@ def download(split, max_bytes, path):
 
 
 def clean(raw):
-    """Splits into whole stories, keeps the ones made of plain characters, joins them with EOS."""
+    """Splits into whole stories and keeps the ones made of plain characters."""
     text = raw.decode("utf-8", errors="ignore")
     for a, b in REPLACE.items():
         text = text.replace(a, b)
@@ -67,20 +75,34 @@ def clean(raw):
         story = story.strip()
         if story and set(story) <= ALLOWED:
             kept.append(story)
-    return "".join(s + EOS for s in kept), len(kept), len(stories)
+    return kept, len(stories)
 
 
-def load_data(data_mb, block_size):
+def mix(stories, problems, seed):
+    """Shuffles stories and math problems together into one stream of EOS-terminated documents."""
+    docs = stories + problems
+    random.Random(seed).shuffle(docs)
+    return "".join(d + EOS for d in docs)
+
+
+def load_data(data_mb, block_size, p, seed):
     val_mb = max(1, data_mb // 20)
     train_path, val_path = f"data/train-{data_mb}mb.txt", f"data/valid-{val_mb}mb.txt"
     download("train", data_mb * 1_000_000, train_path)
     download("valid", val_mb * 1_000_000, val_path)
     with open(train_path, "rb") as f:
-        train_text, kept, total = clean(f.read())
+        stories, total = clean(f.read())
     with open(val_path, "rb") as f:
-        val_text, _, _ = clean(f.read())
+        val_stories, _ = clean(f.read())
+    story_chars = sum(len(s) + 1 for s in stories)
+    math_train, math_val, math_test = arithmetic.make_sets(
+        p["math_problems"], max(1, p["math_problems"] // 50), p["math_test"], seed=seed)
+    train_text = mix(stories, math_train, seed)
+    val_text = mix(val_stories, math_val, seed + 1)
     vocab = "".join(sorted(set(train_text)))
-    print(f"{kept:,} of {total:,} stories kept, {len(train_text):,} characters, vocabulary of {len(vocab)}")
+    print(f"{len(stories):,} of {total:,} stories kept ({story_chars:,} characters), "
+          f"{len(math_train):,} math problems ({len(train_text) - story_chars:,} characters), "
+          f"vocabulary of {len(vocab)}")
     table = {ord(ch): i for i, ch in enumerate(vocab)}
     val_text = "".join(ch for ch in val_text if ord(ch) in table)
 
@@ -90,7 +112,9 @@ def load_data(data_mb, block_size):
 
     train, val = encode(train_text), encode(val_text)
     assert len(val) > block_size + 1, "validation set too small"
-    return train, val, vocab, len(train_text)
+    stats = {"story_characters": story_chars, "math_characters": len(train_text) - story_chars,
+             "math_problems": len(math_train)}
+    return train, val, vocab, stats, math_test
 
 
 def get_batch(data, block_size, batch_size, device):
@@ -130,7 +154,7 @@ def main():
     if device == "cpu" and args.preset == "default":
         print("warning: no GPU found. In Colab: Runtime > Change runtime type > T4 GPU.")
 
-    train, val, vocab, n_chars = load_data(p["data_mb"], p["block_size"])
+    train, val, vocab, data_stats, math_test = load_data(p["data_mb"], p["block_size"], p, args.seed)
     cfg = GPTConfig(vocab_size=len(vocab), block_size=p["block_size"],
                     n_layer=p["n_layer"], n_head=p["n_head"], n_embd=p["n_embd"])
     model = GPT(cfg).to(device)
@@ -161,15 +185,41 @@ def main():
     @torch.no_grad()
     def sample(length=300):
         model.eval()
-        idx = torch.tensor([[stoi[c] for c in SAMPLE_PROMPT]], device=device)
+        # Start with EOS like the browser does: "a new document begins here".
+        idx = torch.tensor([[eos_id] + [stoi[c] for c in SAMPLE_PROMPT]], device=device)
         out = model.generate(idx, length, temperature=0.8, top_k=40, stop_token=eos_id)[0].tolist()
         model.train()
-        return "".join(vocab[i] for i in out).split(EOS)[0]
+        return "".join(vocab[i] for i in out[1:]).split(EOS)[0]
+
+    @torch.no_grad()
+    def solve(questions):
+        """Greedy answers (always the most likely character), batched by question length so every
+        row keeps the same positions it would have alone in the browser."""
+        model.eval()
+        groups = defaultdict(list)
+        for q in questions:
+            groups[len(q)].append(q)
+        answers = {}
+        for n, qs in groups.items():
+            idx = torch.tensor([[eos_id] + [stoi[c] for c in q] for q in qs], device=device)
+            for _ in range(arithmetic.MAX_DIGITS + 2):  # longest answer is "1998" or "-999", then EOS
+                with autocast():
+                    logits, _ = model(idx)
+                idx = torch.cat([idx, logits[:, -1].argmax(-1, keepdim=True)], dim=1)
+            for q, row in zip(qs, idx[:, n + 1 :].tolist()):
+                answers[q] = "".join(vocab[i] for i in row).split(EOS)[0]
+        model.train()
+        return answers
+
+    def math_score(pairs):
+        got = solve([q for q, _ in pairs])
+        rows = [(q, a, got[q]) for q, a in pairs]
+        return arithmetic.score(rows), rows
 
     os.makedirs(args.out, exist_ok=True)
     log = {
-        "dataset": "TinyStories (Eldan & Li, 2023)",
-        "characters": n_chars,
+        "dataset": "TinyStories (Eldan & Li, 2023) + generated addition and subtraction",
+        "characters": data_stats["story_characters"] + data_stats["math_characters"],
         "params": model.num_params(),
         "config": cfg.to_dict(),
         "batch_size": p["batch_size"],
@@ -177,7 +227,15 @@ def main():
         "device": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
         "loss": [],
         "samples": [],
+        "math": {
+            "ops": ["+", "-"],
+            "max_digits": arithmetic.MAX_DIGITS,
+            "train_problems": data_stats["math_problems"],
+            "test_problems": len(math_test),
+            "accuracy": [],
+        },
     }
+    eval_set = math_test[:: max(1, len(math_test) // p["math_eval"])][: p["math_eval"]]
 
     def save(step, elapsed):
         log["steps_done"] = step
@@ -193,6 +251,8 @@ def main():
         if step % p["eval_every"] == 0 or step == p["iters"]:
             losses = estimate_loss()
             log["loss"].append({"step": step, **losses})
+            acc, _ = math_score(eval_set)
+            log["math"]["accuracy"].append({"step": step, "acc": acc["overall"]})
             text = sample()
             # Keep a handful of samples to show how the writing improves (first, early, middle, last).
             if step in (0, p["eval_every"], 4 * p["eval_every"]) or step == p["iters"] or step == p["iters"] // 2:
@@ -200,7 +260,8 @@ def main():
             elapsed = time.time() - start
             eta = elapsed / max(step, 1) * (p["iters"] - step)
             print(f"step {step:>5} | train {losses['train']:.3f} | val {losses['val']:.3f} "
-                  f"| {elapsed / 60:.1f} min, ~{eta / 60:.0f} min left\n    {text[:120]!r}")
+                  f"| math {acc['overall']:.0f}% | {elapsed / 60:.1f} min, ~{eta / 60:.0f} min left"
+                  f"\n    {text[:120]!r}")
             save(step, elapsed)
         if step == p["iters"]:
             break
@@ -217,6 +278,16 @@ def main():
         scaler.step(opt)
         scaler.update()
 
+    # Final exam: every held-out problem, which the model never saw during training.
+    final, rows = math_score(math_test)
+    log["math"]["final"] = final
+    wrong = [r for r in rows if r[1] != r[2]]
+    log["math"]["examples"] = [{"q": q, "expected": a, "got": g} for q, a, g in (rows[:6] + wrong[:6])]
+    save(p["iters"], time.time() - start)
+    print(f"math on {final['count']:,} problems it never saw: {final['overall']}% correct "
+          f"(addition {final['add']}%, subtraction {final['sub']}%)")
+    if wrong:
+        print("    some mistakes:", ", ".join(f"{q}{g} (should be {a})" for q, a, g in wrong[:5]))
     print(f"done in {(time.time() - start) / 60:.1f} min. Next: python export.py")
 
 
