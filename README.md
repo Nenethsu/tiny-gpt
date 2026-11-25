@@ -27,6 +27,9 @@ no server, no API, no ML library.
 - `weights_format.py`: the `model.json` + `model.bin` format. Pure Python.
 - `reference.py`: a pure-Python forward pass, plus a random self-test model for the engine.
 - `colab.ipynb`: run everything on Google Colab.
+- `pretrain.py`: step 1 of the Tiny GPT Reader: a ~17.5M-parameter model that reads word pieces,
+  pretrained on Simple English Wikipedia. Saves and resumes from its `--out` folder.
+- `reader.ipynb`: run the Reader pretraining on Colab, with progress saved to Google Drive.
 
 ## Train
 
