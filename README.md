@@ -17,6 +17,9 @@ no server, no API, no ML library.
 ## Files
 
 - `model.py`: the GPT in PyTorch.
+- `bpe.py`: the byte-level BPE tokenizer for the coming Tiny GPT Reader (word pieces instead of
+  characters). Pure Python; `python bpe.py test` tests it. The portfolio has a TypeScript copy
+  that `npm run check:bpe` compares against test cases from `python bpe.py vectors`.
 - `arithmetic.py`: makes the math problems and the held-out exam. Pure Python; `python arithmetic.py` tests it.
 - `train.py`: downloads the stories, mixes in the math, trains, and logs loss, math score and
   sample stories to `out/training.json`.
