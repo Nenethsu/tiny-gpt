@@ -47,6 +47,8 @@ no server, no API, no ML library.
 - `export_reader.py`: writes the Reader's browser files (weights, tokenizer, engine check,
   and `reader.json` with the exam scores and cut-off).
 - `reader.ipynb`: run every Reader step on Colab, with progress saved to Google Drive.
+- `kaggle_span.ipynb`: the pointing Reader on Kaggle's GPU, for when Colab's GPU limit is reached.
+  Needs the pretrained model as a Kaggle Dataset (the last cell of `reader.ipynb` prepares it).
 
 ## Train
 
