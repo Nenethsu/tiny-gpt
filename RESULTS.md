@@ -34,6 +34,7 @@ shown answers that are exactly right.
 | Date | Run | Steps / time | SQuAD exact / F1 | SQuAD no-answer | SQuAD shown (right) | CoQA exact / F1 | CoQA shown (right) | Notes |
 |---|---|---|---|---|---|---|---|---|
 | 2026-11-26 | From the pretraining above | 10,000 / 21 min, T4 | **42.0 / 44.1** | 66.2% | 38.0% (22.8%) | **35.1 / 41.7** | 93.2% (37.5%) | Flat after ~7,000 steps. Answerable SQuAD questions: about 1 in 6 exactly right |
+| 2026-11-26 | **Pointing (span) Reader**, same pretraining (`finetune_span.py`) | 10,000 / 16 min, T4 | **53.7 / 57.6** | 71.7% | 43.3% (40.7%) | **48.4 / 58.8** | 98.6% (49.0%) | +11.7 / +13.3 exact over writing the answer, from the same model. SQuAD exam 11,821 questions |
 
 ### Confidence cut-off (evaluate.py)
 
@@ -45,3 +46,4 @@ Target: shown answers exactly right at least 80% of the time.
 | 2026-11-26 | Free (greedy) | 1,500 SQuAD + 1,500 CoQA (CPU) | none reaches 80% | at 0.95: 4.4% | 72.7% | Sample scores match the full exam (SQuAD 41.3 vs 42.0, CoQA 35.5 vs 35.1). At 0.8: 30.1% shown, 47.7% right |
 | 2026-11-26 | Forced copying | 1,500 SQuAD + 1,500 CoQA (CPU) | none reaches 80% | at 0.95: 4.4% (raw) / 8.4% (within allowed) | 72.7% / 61.1% | Barely differs from free: the Reader already copies; its mistakes are picking the wrong phrase. "Useful" (F1 ≥ 0.5) only ~7 points above exact |
 | 2026-11-26 | Free + agreement check | 1,500 SQuAD + 1,500 CoQA (CPU) | none reaches 80% | at 0.9: 5.6% | 62.7% | Only 44.9% of span answers lie inside the search's sentence; agreement halves coverage for ~4 points. Yes/no alone: 65.1% right overall, 80.8% at 0.9 (1.7% shown) |
+| 2026-11-26 | **Pointing (span) Reader** | every question (11,821 SQuAD + 7,962 CoQA, GPU) | **0.6** | 8.9% | **82.2%** (84.8% useful) | First setting to pass 80%. At 0.5: 13.2% shown, 79.1% right; at 0.4: 19.2% shown, 74.1% right. Confidence now tracks correctness. Agreement check adds nothing (0.6: 5.7% shown, 81.0% right): only 61% of answers lie in the search's sentence. Yes/no alone: 81% right at 0.5 |
