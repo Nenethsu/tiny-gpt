@@ -44,3 +44,4 @@ Target: shown answers exactly right at least 80% of the time.
 |---|---|---|---|---|---|---|
 | 2026-11-26 | Free (greedy) | 1,500 SQuAD + 1,500 CoQA (CPU) | none reaches 80% | at 0.95: 4.4% | 72.7% | Sample scores match the full exam (SQuAD 41.3 vs 42.0, CoQA 35.5 vs 35.1). At 0.8: 30.1% shown, 47.7% right |
 | 2026-11-26 | Forced copying | 1,500 SQuAD + 1,500 CoQA (CPU) | none reaches 80% | at 0.95: 4.4% (raw) / 8.4% (within allowed) | 72.7% / 61.1% | Barely differs from free: the Reader already copies; its mistakes are picking the wrong phrase. "Useful" (F1 ≥ 0.5) only ~7 points above exact |
+| 2026-11-26 | Free + agreement check | 1,500 SQuAD + 1,500 CoQA (CPU) | none reaches 80% | at 0.9: 5.6% | 62.7% | Only 44.9% of span answers lie inside the search's sentence; agreement halves coverage for ~4 points. Yes/no alone: 65.1% right overall, 80.8% at 0.9 (1.7% shown) |
