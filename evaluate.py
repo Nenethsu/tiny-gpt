@@ -14,10 +14,17 @@ often shown answers are exactly right, and how often they are useful (F1 >= 0.5 
 answer). It recommends the combination that shows the most answers while shown answers are
 exactly right at least --target percent of the time.
 
-    python evaluate.py --qa /content/drive/MyDrive/tiny-gpt-reader/qa --limit 1500   # CPU, ~20 min
-    python evaluate.py --qa /content/drive/MyDrive/tiny-gpt-reader/qa                # GPU: every question
+Agreement check: the chat shows a search sentence anyway, so an answer can also be required to
+lie inside the sentence the chat's search picks (chat_search.py, ported from the server). Two
+methods agreeing is often more reliable than either alone. Yes/no answers have no span, so they
+are counted on their own.
 
-Writes calibration.json next to the checkpoint.
+    python evaluate.py --qa /content/drive/MyDrive/tiny-gpt-reader/qa --limit 1500   # CPU, ~10 min
+    python evaluate.py --qa /content/drive/MyDrive/tiny-gpt-reader/qa --modes free copy
+    python evaluate.py --qa /content/drive/MyDrive/tiny-gpt-reader/qa --from-predictions  # seconds
+
+Writes calibration.json and predictions.json (every answer, so later checks need no model run)
+next to the checkpoint.
 """
 
 import argparse
@@ -31,6 +38,7 @@ import torch
 import torch.nn.functional as F
 
 import bpe
+import chat_search
 import finetune as ft
 from model import GPT, GPTConfig
 
@@ -180,12 +188,14 @@ def answer(tok, tokens):
     return tok.decode(body).strip()
 
 
-def table(rows, confidence):
-    """rows: dicts with pred, raw, allowed, golds, passage. Per cut-off: shown, right, useful."""
+def table(rows, confidence, allow=lambda r: True):
+    """rows: dicts with pred, raw, allowed, golds, passage, agree. Per cut-off: shown, right,
+    useful. `allow` adds a condition (e.g. the agreement check)."""
     out = []
     answerable = sum(1 for r in rows if r["golds"])
     for t in THRESHOLDS:
-        shown = [r for r in rows if r["pred"] and r[confidence] >= t and ft.shown(r["pred"], r["passage"])]
+        shown = [r for r in rows if r["pred"] and r[confidence] >= t and ft.shown(r["pred"], r["passage"])
+                 and allow(r)]
         right = sum(1 for r in shown if any(ft.normalize(r["pred"]) == ft.normalize(g) for g in r["golds"]))
         useful = sum(1 for r in shown if r["golds"] and max(ft.f1(r["pred"], g) for g in r["golds"]) >= 0.5)
         out.append({
@@ -206,16 +216,27 @@ def print_table(title, rows):
         print(f"  {r['cutoff']:<5} | {r['shown']:>5}% | {right:>6} | {useful:>6} | {r['answered_right']}%")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--qa", default="out-reader/qa", help="the finetune.py output folder")
-    ap.add_argument("--limit", type=int, help="questions per exam (a random sample); default: all")
-    ap.add_argument("--target", type=float, default=80.0, help="wanted %% exactly right among shown answers")
-    ap.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
-    ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--device")
-    args = ap.parse_args()
+FILTERS = {
+    "cut-off only": lambda r: True,
+    "agreement + cut-off": lambda r: r["agree"],
+    "yes/no only": lambda r: ft.is_yes_no(r["pred"]),
+}
 
+
+def add_agreement(rows):
+    """Marks each row: does its (non yes/no) answer lie inside the chat search's best sentence?
+    The exam passages play the library, for idf."""
+    idf = chat_search.Idf(list({r["passage"] for r in rows}))
+    for r in rows:
+        if r["pred"] and not ft.is_yes_no(r["pred"]):
+            r["sentence"] = chat_search.best_sentence(r["passage"], r["question"], idf)
+            r["agree"] = r["pred"] in r["sentence"]
+        else:
+            r["agree"] = False
+    return rows
+
+
+def run_model(args):
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_grad_enabled(False)
     tok = bpe.Tokenizer.load(os.path.join(args.qa, "tokenizer.json"))
@@ -243,10 +264,9 @@ def main():
         raise SystemExit(f"cached generation disagrees with plain greedy on {len(differ)} of 12: {differ[:2]}")
     print(f"cached generation matches plain greedy on {12 - len(differ)} of 12 questions")
 
-    result = {"target_right": args.target, "questions": {k: len(v) for k, v in exams.items()}, "modes": {}}
-    candidates = []
+    predictions = {}
     for mode in args.modes:
-        all_rows, per_exam = [], {}
+        predictions[mode] = []
         for name, examples in exams.items():
             started = time.time()
             order = sorted(range(len(examples)), key=lambda i: len(examples[i][0]))  # similar lengths together
@@ -258,33 +278,73 @@ def main():
                 toks, raw, within = generate(model, prompts, eos, rules)
                 for i, t, pr, pw in zip(part, toks, raw, within):
                     info = examples[i][2]
-                    rows[i] = {"pred": answer(tok, t), "raw": geo_mean(pr), "allowed": geo_mean(pw),
+                    rows[i] = {"exam": name, "question": info["question"], "history": info.get("history", []),
+                               "pred": answer(tok, t), "raw": geo_mean(pr), "allowed": geo_mean(pw),
                                "golds": info["answers"], "passage": info["passage"]}
                 if (k // args.batch) % 20 == 0:
                     done = k + len(part)
                     rate = done / (time.time() - started)
                     print(f"  {mode} / {name}: {done:,} of {len(examples):,} ({rate:.1f} questions/s, "
                           f"~{(len(examples) - done) / rate / 60:.0f} min left)")
-            sc = ft.score([(r["pred"], r["golds"], r["passage"]) for r in rows])
-            per_exam[name] = sc
-            all_rows += rows
-            print(f"{mode.upper()} / {name.upper()} ({len(rows):,}): exact {sc['exact_match']}%, F1 {sc['f1']}%, "
-                  f"no-answer {sc['no_answer_correct']}%, shown {sc['shown']}% ({sc['shown_correct']}% right) "
-                  f"in {(time.time() - started) / 60:.1f} min")
-        tables = {c: table(all_rows, c) for c in CONFIDENCES}
-        result["modes"][mode] = {"exams": per_exam, "cutoffs": tables}
-        for c in CONFIDENCES:
-            print_table(f"{mode} decoding, {c} confidence (both exams together)", tables[c])
-            for row in tables[c]:
-                if row["right"] is not None and row["right"] >= args.target:
-                    candidates.append({"decoding": mode, "confidence": c, **row})
-                    break
+            predictions[mode] += rows
+            print(f"  {mode} / {name}: done in {(time.time() - started) / 60:.1f} min")
+    with open(os.path.join(args.qa, "predictions.json"), "w", encoding="utf-8") as f:
+        json.dump(predictions, f)
+    return predictions
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--qa", default="out-reader/qa", help="the finetune.py output folder")
+    ap.add_argument("--limit", type=int, help="questions per exam (a random sample); default: all")
+    ap.add_argument("--target", type=float, default=80.0, help="wanted %% exactly right among shown answers")
+    ap.add_argument("--modes", nargs="+", choices=MODES, default=["free"])
+    ap.add_argument("--from-predictions", action="store_true",
+                    help="reuse predictions.json from an earlier run instead of running the model")
+    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--device")
+    args = ap.parse_args()
+
+    if args.from_predictions:
+        with open(os.path.join(args.qa, "predictions.json"), encoding="utf-8") as f:
+            predictions = json.load(f)
+        print("reusing predictions.json: " + ", ".join(f"{m} ({len(r):,} answers)" for m, r in predictions.items()))
+    else:
+        predictions = run_model(args)
+
+    result = {"target_right": args.target, "modes": {}}
+    candidates = []
+    for mode, rows in predictions.items():
+        add_agreement(rows)
+        result["modes"][mode] = {"exams": {}, "tables": {}}
+        for name in ("squad", "coqa"):
+            part = [r for r in rows if r["exam"] == name]
+            sc = ft.score([(r["pred"], r["golds"], r["passage"]) for r in part])
+            result["modes"][mode]["exams"][name] = sc
+            print(f"{mode.upper()} / {name.upper()} ({len(part):,}): exact {sc['exact_match']}%, F1 {sc['f1']}%, "
+                  f"no-answer {sc['no_answer_correct']}%, shown {sc['shown']}% ({sc['shown_correct']}% right)")
+        spans = [r for r in rows if r["pred"] and not ft.is_yes_no(r["pred"]) and ft.shown(r["pred"], r["passage"])]
+        agree = [r for r in spans if r["agree"]]
+        print(f"  answers inside the search's sentence: {len(agree):,} of {len(spans):,} span answers "
+              f"({100 * len(agree) / max(1, len(spans)):.1f}%)")
+        confidences = CONFIDENCES if mode == "copy" else ("raw",)
+        for c in confidences:
+            for fname, allow in FILTERS.items():
+                rows_t = table(rows, c, allow)
+                result["modes"][mode]["tables"][f"{c} / {fname}"] = rows_t
+                print_table(f"{mode} decoding, {c} confidence, {fname} (both exams)", rows_t)
+                if fname == "yes/no only":
+                    continue  # reported for a closer look, not a way to answer on its own
+                for row in rows_t:
+                    if row["right"] is not None and row["right"] >= args.target:
+                        candidates.append({"decoding": mode, "confidence": c, "filter": fname, **row})
+                        break
 
     best = max(candidates, key=lambda r: r["shown"]) if candidates else None
     result["recommended"] = best
     if best:
-        print(f"\nrecommended: {best['decoding']} decoding, {best['confidence']} confidence, cut-off "
-              f"{best['cutoff']}: answers shown {best['shown']}% of the time, {best['right']}% of those "
+        print(f"\nrecommended: {best['decoding']} decoding, {best['confidence']} confidence, {best['filter']}, "
+              f"cut-off {best['cutoff']}: answers shown {best['shown']}% of the time, {best['right']}% of those "
               f"exactly right, {best['useful']}% useful")
     else:
         print(f"\nno combination reaches {args.target}% exactly right; the tables above show the best")
