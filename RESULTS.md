@@ -43,3 +43,4 @@ Target: shown answers exactly right at least 80% of the time.
 | Date | Decoding | Questions scored | Best cut-off | Shown | Right among shown | Notes |
 |---|---|---|---|---|---|---|
 | 2026-11-26 | Free (greedy) | 1,500 SQuAD + 1,500 CoQA (CPU) | none reaches 80% | at 0.95: 4.4% | 72.7% | Sample scores match the full exam (SQuAD 41.3 vs 42.0, CoQA 35.5 vs 35.1). At 0.8: 30.1% shown, 47.7% right |
+| 2026-11-26 | Forced copying | 1,500 SQuAD + 1,500 CoQA (CPU) | none reaches 80% | at 0.95: 4.4% (raw) / 8.4% (within allowed) | 72.7% / 61.1% | Barely differs from free: the Reader already copies; its mistakes are picking the wrong phrase. "Useful" (F1 ≥ 0.5) only ~7 points above exact |
