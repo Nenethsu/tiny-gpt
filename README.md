@@ -16,6 +16,8 @@ no server, no API, no ML library.
 
 ## Files
 
+- `RESULTS.md`: every training run and its exam scores, so progress is easy to compare.
+
 - `model.py`: the GPT in PyTorch.
 - `bpe.py`: the byte-level BPE tokenizer for the coming Tiny GPT Reader (word pieces instead of
   characters). Pure Python; `python bpe.py test` tests it. The portfolio has a TypeScript copy
