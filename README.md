@@ -35,6 +35,9 @@ no server, no API, no ML library.
   from a passage in a conversation (follow-ups, yes/no, or "no answer"), and scores it on both
   dev sets.
   `python finetune.py --check-data` tests the data side without a GPU.
+- `finetune_span.py`: the pointing Reader: fine-tunes the same pretraining to point at the answer's
+  start and end in the passage (or yes / no / no answer) instead of writing it, with the same exams
+  and a confidence cut-off table. `--check-data` tests the data side without a GPU.
 - `evaluate.py`: scores the fine-tuned Reader with a confidence for each answer, free or forced to
   copy from the passage, and recommends how the portfolio should decode and which cut-off to use
   (shown answers exactly right at least 80% of the time), with or without the agreement check.
