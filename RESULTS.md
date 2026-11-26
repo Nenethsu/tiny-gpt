@@ -38,5 +38,8 @@ shown answers that are exactly right.
 ### Confidence cut-off (evaluate.py)
 
 The chat shows the Reader's answer only above this cut-off; below it, the source sentence.
+Target: shown answers exactly right at least 80% of the time.
 
-Not run yet.
+| Date | Decoding | Questions scored | Best cut-off | Shown | Right among shown | Notes |
+|---|---|---|---|---|---|---|
+| 2026-11-26 | Free (greedy) | 1,500 SQuAD + 1,500 CoQA (CPU) | none reaches 80% | at 0.95: 4.4% | 72.7% | Sample scores match the full exam (SQuAD 41.3 vs 42.0, CoQA 35.5 vs 35.1). At 0.8: 30.1% shown, 47.7% right |
