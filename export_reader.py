@@ -9,7 +9,7 @@ Reads root/qa/ckpt.pt (fine-tuned), root/qa/tokenizer.json, and the logs. Writes
     check.json      logits PyTorch computes from the exported weights at a few positions of a
                     real reader prompt, for the portfolio's engine check
     reader.json     what the page shows: model size, pretraining and fine-tuning stats, exam
-                    scores, and the confidence cut-off from evaluate.py
+                    scores, and how to decode and gate answers (evaluate.py)
 Runs on CPU (Colab's CPU runtime is fine).
 """
 
@@ -95,13 +95,14 @@ def main():
         "exams": fine.get("final"),
         "examples": fine.get("examples"),
         "calibration": cal,
-        "cutoff": cal.get("recommended_cutoff") if cal else None,
+        # How the browser should answer: decoding ("copy"/"free"), confidence kind and cut-off.
+        "decoding": cal.get("recommended") if cal else None,
         "history_turns": ft.HISTORY_TURNS,
     }
     with open(os.path.join(args.out, "reader.json"), "w", encoding="utf-8") as f:
         json.dump(reader, f, indent=1)
     if not cal:
-        print("note: no calibration.json yet (run evaluate.py), so reader.json has no cut-off")
+        print("note: no calibration.json yet (run evaluate.py), so reader.json has no decoding choice")
     print(f"wrote {args.out}/. Copy these files to the portfolio's public/models/tiny-gpt-reader/")
 
 

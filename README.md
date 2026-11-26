@@ -35,8 +35,9 @@ no server, no API, no ML library.
   from a passage in a conversation (follow-ups, yes/no, or "no answer"), and scores it on both
   dev sets.
   `python finetune.py --check-data` tests the data side without a GPU.
-- `evaluate.py`: scores the fine-tuned Reader with a confidence for each answer and picks the
-  cut-off the portfolio uses (shown answers right at least 80% of the time). Runs on CPU.
+- `evaluate.py`: scores the fine-tuned Reader with a confidence for each answer, free or forced to
+  copy from the passage, and recommends how the portfolio should decode and which cut-off to use
+  (shown answers exactly right at least 80% of the time). Runs on CPU.
 - `export_reader.py`: writes the Reader's browser files (weights, tokenizer, engine check,
   and `reader.json` with the exam scores and cut-off).
 - `reader.ipynb`: run every Reader step on Colab, with progress saved to Google Drive.
